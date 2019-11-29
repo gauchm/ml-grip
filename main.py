@@ -1,71 +1,84 @@
-import argparse
 import json
-import pickle
 import random
-from typing import Dict, List, Tuple
-from tqdm import tqdm
+import argparse
+from pathlib import Path
+from typing import Dict
 
-import pandas as pd
 import numpy as np
-from sklearn.linear_models import LinearRegression
-import torch
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 
-from src.datautils import (load_grip_gl_discharge,
-                           load_wfdei_gem_capa_lumped_forcings)
-
-
-GLOBAL_SETTINGS = {
-    
-}
+from mlstream.experiment import Experiment
+from mlstream.utils import store_results
+from mlstream.datautils import get_basin_list
+from mlstream.models.base_models import LumpedModel
+from mlstream.models.sklearn_models import LumpedSklearnRegression
+from mlstream.models.lstm import LumpedLSTM
 
 
 def get_args() -> Dict:
-    """Parse input arguments
+    """Parses input arguments.
+
     Returns
     -------
     dict
         Dictionary containing the run config.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=["train", "evaluate"])
-    parser.add_argument('model_type', choices=["xgboost", "linearRegression"])
-    parser.add_argument('--seq_length', type=int, help="Number of historical time steps to feed the model.")
-    
-    parser.add_argument('--data_root', type=str, help="Root directory of data set")
-    parser.add_argument('--seed', type=int, required=False, help="Random seed")
-    parser.add_argument('--run_dir', type=str, help="For evaluation mode. Path to run directory.")
-    parser.add_argument('--num_workers',
-                        type=int,
-                        default=12,
-                        help="Number of parallel threads for data loading")
-    parser.add_argument('--use_mse',
-                        action='store_true',
+    parser.add_argument('mode', choices=["train", "predict"])
+    parser.add_argument('--model_type', type=str, help="Model to train.")
+    parser.add_argument('--use_mse', action='store_true',
                         help="If provided, uses MSE as objective/loss function.")
-    parser.add_argument('--run_dir_base', type=str, default="runs", help="For training mode. Path to store run directories in.")
-    parser.add_argument('--run_name', type=str, required=False, help="For training mode. Name of the run.")
-    parser.add_argument('--train_start', type=str, help="Training start date (ddmmyyyy).")
-    parser.add_argument('--train_end', type=str, help="Training end date (ddmmyyyy).")
-    parser.add_argument('--basins', 
-                        nargs='+',
-                        help='List of basins')
+    parser.add_argument('--no_static', action='store_true',
+                        help="If True, trains without static features")
+    parser.add_argument('--concat_static', action='store_true',
+                        help="If True, train with static features concatenated at each time step")
+    parser.add_argument('--model_args', required=False, type=json.loads,
+                        help="Additional arguments to pass to the model, \
+                        provided as dictionary, e.g.: '{\"dropout\": 0.1}'")
+
+    parser.add_argument('--seq_length', type=int, default=10,
+                        help="Number of historical time steps to feed the model.")
+
+    parser.add_argument('--data_root', type=str, help="Root directory of data set")
+    parser.add_argument('--run_dir', type=str,
+                        help="Path to run directory (folder will be created in training mode).")
+
+    parser.add_argument('--start_date', type=str, help="Start date (training start date in \
+        training mode, validation start date in prediction mode) (ddmmyyyy).")
+    parser.add_argument('--end_date', type=str, help="End date (training end date in \
+        training mode, validation end date in prediction mode) (ddmmyyyy).")
+
+    parser.add_argument('--basins', nargs='+', required=False,
+                        help='List of basins to train or predict. Default in training: subset of \
+                        calibration basins; in prediction: remaining calibration basins')
+    parser.add_argument('--forcing_attributes', nargs='+',
+                        default=["PRECIP", "TEMP_DAILY_AVE", "TEMP_MIN", "TEMP_MAX"],
+                        help='List of forcing attributes to use. Default is all attributes.')
+    parser.add_argument('--static_attributes', nargs='+', required=False,
+                        default=["Area2", "Lat_outlet", "Lon_outlet", "RivSlope", "Rivlen",
+                                 "BasinSlope", "BkfWidth", "BkfDepth", "MeanElev", "FloodP_n",
+                                 "Q_mean", "Ch_n", "Perim_m"],
+                        help='List of basin attributes to use.')
+
+    parser.add_argument('--seed', type=int, required=False, help="Random seed")
+    parser.add_argument('--num_workers', type=int, default=12,
+                        help="Number of parallel threads for data loading")
+    parser.add_argument('--cache_data', action='store_true',
+                        help="If True, loads all data into memory")
+
     cfg = vars(parser.parse_args())
-    
-    cfg["train_start"] = pd.to_datetime(cfg["train_start"], format='%d%m%Y')
-    cfg["train_end"] = pd.to_datetime(cfg["train_end"], format='%d%m%Y')
 
     # Validation checks
     if (cfg["mode"] == "train") and (cfg["seed"] is None):
         # generate random seed for this run
         cfg["seed"] = int(np.random.uniform(low=0, high=1e6))
 
-    if (cfg["mode"] == "evaluate") and (cfg["run_dir"] is None):
-        raise ValueError("In evaluation mode a run directory (--run_dir) has to be specified")
-        
-    if cfg["seq_length"] < 0:
+    if (cfg["mode"] == "predict") and (cfg["run_dir"] is None):
+        raise ValueError("In prediction mode a run directory (--run_dir) has to be specified")
+
+    if cfg["seq_length"] is not None and cfg["seq_length"] < 0:
         raise ValueError("Sequence length can not be negative.")
-        
-    # combine global settings with user config
-    cfg.update(GLOBAL_SETTINGS)
 
     if cfg["mode"] == "train":
         # print config to terminal
@@ -74,118 +87,124 @@ def get_args() -> Dict:
 
     # convert str paths to Path objects
     cfg["data_root"] = Path(cfg["data_root"])
-    if cfg["run_dir"] is not None:
-        cfg["run_dir"] = Path(cfg["run_dir"])
-    if cfg["run_dir_base"] is not None:
-        cfg["run_dir_base"] = Path(cfg["run_dir_base"])
-    
-    return cfg
+    cfg["run_dir"] = Path(cfg["run_dir"])
 
-
-def _setup_run(cfg: Dict) -> Dict:
-    """Create folder structure for this run
-    
-    Parameters
-    ----------
-    cfg: dict
-        Dictionary containing the run config
-        
-    Returns
-    -------
-    dict
-        Dictionary containing the updated run config
-    """
-    now = datetime.now()
-    day = f"{now.day}".zfill(2)
-    month = f"{now.month}".zfill(2)
-    hour = f"{now.hour}".zfill(2)
-    minute = f"{now.minute}".zfill(2)
-    second = f"{now.second}".zfill(2)
-    if cfg["run_name"] is None:
-        run_name = f'run_{cfg["model_type"]}_{day}{month}_{hour}{minute}{second}_seed{cfg["seed"]}'
-    else:
-        run_name = cfg["run_name"]
-    cfg['run_dir'] = Path(__file__).absolute().parent / cfg["run_dir_base"] / run_name
-    if not cfg["run_dir"].is_dir():
-        cfg["train_dir"] = cfg["run_dir"] / 'data' / 'train'
-        cfg["train_dir"].mkdir(parents=True)
-        cfg["val_dir"] = cfg["run_dir"] / 'data' / 'val'
-        cfg["val_dir"].mkdir(parents=True)
-    else:
-        raise RuntimeError('There is already a folder at {}'.format(cfg["run_dir"]))
-
-    # dump a copy of cfg to run directory
-    with (cfg["run_dir"] / 'cfg.json').open('w') as fp:
-        temp_cfg = {}
-        for key, val in cfg.items():
-            if isinstance(val, PosixPath):
-                temp_cfg[key] = str(val)
-            elif isinstance(val, pd.Timestamp):
-                temp_cfg[key] = val.strftime(format="%d%m%Y")
-            elif 'param_dist' in key:
-                temp_dict = {}
-                for k, v in val.items():
-                    if isinstance(v, sp.stats._distn_infrastructure.rv_frozen):
-                        temp_dict[k] = f"{v.dist.name}{v.args}, *kwds={v.kwds}"
-                    else:
-                        temp_dict[k] = str(v)
-                temp_cfg[key] = str(temp_dict)
-            else:
-                temp_cfg[key] = val
-        json.dump(temp_cfg, fp, sort_keys=True, indent=4)
-
-    return cfg
-
-
-def _prepare_data(cfg: Dict, basins: List) -> Dict:
-    """Preprocess training data.
-    
-    Parameters
-    ----------
-    cfg : dict
-        Dictionary containing the run config
-    basins : List
-        List containing the gauge ids
-        
-    Returns
-    -------
-    dict
-        Dictionary containing the updated run config
-    """
-    # create database file containing the static basin attributes
-    cfg["db_path"] = str(cfg["run_dir"] / "attributes.db")
-    add_camels_attributes(cfg["camels_root"], db_path=cfg["db_path"])
-
-    # create .h5 files for train and validation data
-    cfg["train_file"] = cfg["train_dir"] / 'train_data.h5'
-    create_h5_files(data_root=cfg["data_root"],
-                    out_file=cfg["train_file"],
-                    basins=basins,
-                    dates=[cfg["train_start"], cfg["train_end"]],
-                    with_basin_str=True,
-                    seq_length=cfg["seq_length"])
+    if cfg["model_args"] is None:
+        cfg["model_args"] = {}
 
     return cfg
 
 
 def train(cfg):
     """Train model.
-    
+
+    Parameters
+    ----------
+    cfg: Dict
+        Dictionary containing the run configuration
+    """
+    random.seed(cfg["seed"])
+    np.random.seed(cfg["seed"])
+
+    if cfg["basins"] is None:
+        print("Using random subset of calibration basins")
+        cal_basins = get_basin_list(cfg["data_root"], "C")
+        cfg["basins"] = np.random.choice(cal_basins,
+                                         size=int(len(cal_basins) * 0.8),
+                                         replace=False)
+
+    run_metadata = {"model_type": cfg["model_type"],
+                    "use_mse": cfg["use_mse"]}
+    run_metadata.update(cfg["model_args"])
+    exp = Experiment(cfg["data_root"], is_train=True, run_dir=cfg["run_dir"],
+                     start_date=cfg["start_date"], end_date=cfg["end_date"],
+                     basins=cfg["basins"], forcing_attributes=cfg["forcing_attributes"],
+                     static_attributes=cfg["static_attributes"], seq_length=cfg["seq_length"],
+                     concat_static=cfg["concat_static"], no_static=cfg["no_static"],
+                     cache_data=cfg["cache_data"], n_jobs=cfg["num_workers"], seed=cfg["seed"],
+                     run_metadata=run_metadata)
+
+    exp.set_model(_get_model(cfg))
+    exp.train()
+
+
+def predict(user_cfg: Dict):
+    """Generate predictions with a trained model
+
+    Parameters
+    ----------
+    user_cfg: Dict
+        Dictionary containing the user entered prediction config
+    """
+    with open(user_cfg["run_dir"] / 'cfg.json', 'r') as fp:
+        run_cfg = json.load(fp)
+
+    if user_cfg["basins"] is None:
+        cal_basins = get_basin_list(user_cfg["data_root"], "C")
+        user_cfg["basins"] = [b for b in cal_basins if b in run_cfg["basins"]]
+
+    exp = Experiment(user_cfg["data_root"], is_train=False,
+                     run_dir=Path(user_cfg["run_dir"]), basins=user_cfg["basins"],
+                     start_date=user_cfg["start_date"], end_date=user_cfg["end_date"])
+
+    # load model
+    model = _get_model(run_cfg)
+    model_filename = 'model_epoch30.pt' if run_cfg["model_type"] == 'lstm' else 'model.pkl'
+    model.load(Path(run_cfg["run_dir"]) / model_filename)
+    exp.set_model(model)
+
+    results = exp.predict()
+    store_results(user_cfg, run_cfg, results)
+
+    nses = exp.get_nse(how=list)
+    print(nses, np.median(nses), np.min(nses), np.max(nses))
+
+
+def _get_model(cfg: Dict) -> LumpedModel:
+    """Creates model to train or evaluate.
+
     Parameters
     ----------
     cfg : Dict
-        Dictionary containing the run config
-    """
-    # fix random seeds
-    random.seed(cfg["seed"])
-    np.random.seed(cfg["seed"])
-    torch.cuda.manual_seed(cfg["seed"])
-    torch.manual_seed(cfg["seed"])
+        Run configuration
 
-    basins = cfg["basins"]
-    
-    
-    
+    Returns
+    -------
+    model : LumpedModel
+        Model to train or evaluate
+
+    Raises
+    ------
+    ValueError
+        If ``cfg["model_type"]`` is invalid.
+    """
+    n_jobs = cfg["num_workers"] if "num_workers" in cfg else 1
+    model_args = cfg["model_args"] if "model_args" in cfg else {}
+    if cfg["model_type"] == 'linearRegression':
+        model = LinearRegression(n_jobs=n_jobs)
+    elif cfg["model_type"] == 'randomForest':
+        model = RandomForestRegressor(n_jobs=n_jobs, **model_args)
+    if model is not None:
+        model = LumpedSklearnRegression(model, no_static=cfg["no_static"],
+                                        concat_static=cfg["concat_static"],
+                                        run_dir=cfg["run_dir"],
+                                        n_jobs=n_jobs)
+    elif cfg["model_type"] == 'lstm':
+        model = LumpedLSTM(len(cfg["forcing_attributes"]),
+                           len(cfg["static_attributes"]),
+                           use_mse=cfg["use_mse"],
+                           no_static=cfg["no_static"],
+                           concat_static=cfg["concat_static"],
+                           run_dir=cfg["run_dir"],
+                           n_jobs=n_jobs,
+                           **model_args)
+
+    else:
+        raise ValueError(f'Unknown model type {cfg["model_type"]}')
+
+    return model
+
+
 if __name__ == "__main__":
     config = get_args()
     globals()[config["mode"]](config)
