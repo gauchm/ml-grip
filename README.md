@@ -2,4 +2,4 @@
 
 Machine learning models for GRIP
 
-This project uUses [mlstream](https://github.com/gauchm/mlstream).
+This project uses [mlstream](https://github.com/gauchm/mlstream).

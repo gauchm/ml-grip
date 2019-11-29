@@ -1,4 +1,5 @@
 import json
+from ast import literal_eval
 import random
 import argparse
 from pathlib import Path
@@ -33,9 +34,9 @@ def get_args() -> Dict:
                         help="If True, trains without static features")
     parser.add_argument('--concat_static', action='store_true',
                         help="If True, train with static features concatenated at each time step")
-    parser.add_argument('--model_args', required=False, type=json.loads,
+    parser.add_argument('--model_args', nargs='+', required=False, type=str,
                         help="Additional arguments to pass to the model, \
-                        provided as dictionary, e.g.: '{\"dropout\": 0.1}'")
+                        provided as list, e.g.: --model_args dropout 0.1.")
 
     parser.add_argument('--seq_length', type=int, default=10,
                         help="Number of historical time steps to feed the model.")
@@ -51,14 +52,14 @@ def get_args() -> Dict:
 
     parser.add_argument('--basins', nargs='+', required=False,
                         help='List of basins to train or predict. Default in training: subset of \
-                        calibration basins; in prediction: remaining calibration basins')
+                        calibration basins; in prediction: all basins.')
     parser.add_argument('--forcing_attributes', nargs='+',
                         default=["PRECIP", "TEMP_DAILY_AVE", "TEMP_MIN", "TEMP_MAX"],
                         help='List of forcing attributes to use. Default is all attributes.')
     parser.add_argument('--static_attributes', nargs='+', required=False,
                         default=["Area2", "Lat_outlet", "Lon_outlet", "RivSlope", "Rivlen",
                                  "BasinSlope", "BkfWidth", "BkfDepth", "MeanElev", "FloodP_n",
-                                 "Q_mean", "Ch_n", "Perim_m"],
+                                 "Q_Mean", "Ch_n", "Perim_m"],
                         help='List of basin attributes to use.')
 
     parser.add_argument('--seed', type=int, required=False, help="Random seed")
@@ -91,6 +92,11 @@ def get_args() -> Dict:
 
     if cfg["model_args"] is None:
         cfg["model_args"] = {}
+    else:
+        if len(cfg["model_args"]) % 2 != 0:
+            raise ValueError("model_args needs to be list of <key> <value> pairs.")
+        cfg["model_args"] = {k: literal_eval(v) for k, v in zip(cfg["model_args"][::2],
+                                                                cfg["model_args"][1::2])}
 
     return cfg
 
@@ -116,6 +122,7 @@ def train(cfg):
     run_metadata = {"model_type": cfg["model_type"],
                     "use_mse": cfg["use_mse"]}
     run_metadata.update(cfg["model_args"])
+    print("Setting up experiment.")
     exp = Experiment(cfg["data_root"], is_train=True, run_dir=cfg["run_dir"],
                      start_date=cfg["start_date"], end_date=cfg["end_date"],
                      basins=cfg["basins"], forcing_attributes=cfg["forcing_attributes"],
@@ -125,6 +132,7 @@ def train(cfg):
                      run_metadata=run_metadata)
 
     exp.set_model(_get_model(cfg))
+    print("Starting training.")
     exp.train()
 
 
@@ -140,8 +148,7 @@ def predict(user_cfg: Dict):
         run_cfg = json.load(fp)
 
     if user_cfg["basins"] is None:
-        cal_basins = get_basin_list(user_cfg["data_root"], "C")
-        user_cfg["basins"] = [b for b in cal_basins if b in run_cfg["basins"]]
+        user_cfg["basins"] = get_basin_list(user_cfg["data_root"], "*")
 
     exp = Experiment(user_cfg["data_root"], is_train=False,
                      run_dir=Path(user_cfg["run_dir"]), basins=user_cfg["basins"],
@@ -156,8 +163,14 @@ def predict(user_cfg: Dict):
     results = exp.predict()
     store_results(user_cfg, run_cfg, results)
 
-    nses = exp.get_nse(how=list)
-    print(nses, np.median(nses), np.min(nses), np.max(nses))
+    nses = exp.get_nses()
+    nse_list = list(nses.values())
+    print("Overall NSEs:", nses, np.median(nse_list),
+          np.min(nse_list), np.max(nse_list))
+    train_nses = {basin: n for basin, n in nses.items() if basin in run_cfg["basins"]}
+    train_nse_list = list(train_nses.values())
+    print("Training basins:", train_nses, np.median(train_nse_list),
+          np.min(train_nse_list), np.max(train_nse_list))
 
 
 def _get_model(cfg: Dict) -> LumpedModel:
@@ -180,6 +193,8 @@ def _get_model(cfg: Dict) -> LumpedModel:
     """
     n_jobs = cfg["num_workers"] if "num_workers" in cfg else 1
     model_args = cfg["model_args"] if "model_args" in cfg else {}
+    model = None
+    # sklearn models
     if cfg["model_type"] == 'linearRegression':
         model = LinearRegression(n_jobs=n_jobs)
     elif cfg["model_type"] == 'randomForest':
@@ -189,9 +204,10 @@ def _get_model(cfg: Dict) -> LumpedModel:
                                         concat_static=cfg["concat_static"],
                                         run_dir=cfg["run_dir"],
                                         n_jobs=n_jobs)
+    # other models
     elif cfg["model_type"] == 'lstm':
         model = LumpedLSTM(len(cfg["forcing_attributes"]),
-                           len(cfg["static_attributes"]),
+                           len(cfg["static_attributes"]) - 2,  # lat/lon is not part of training
                            use_mse=cfg["use_mse"],
                            no_static=cfg["no_static"],
                            concat_static=cfg["concat_static"],
