@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict
 
 import numpy as np
+from scipy import stats
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 
@@ -15,6 +16,22 @@ from mlstream.datautils import get_basin_list
 from mlstream.models.base_models import LumpedModel
 from mlstream.models.sklearn_models import LumpedSklearnRegression
 from mlstream.models.lstm import LumpedLSTM
+from mlstream.models.xgboost import LumpedXGBoost
+
+
+XGB_PARAM_DIST = {
+    'learning_rate': [0.25],
+    'gamma': stats.uniform(0, 5),
+    'max_depth': stats.randint(2, 8),
+    'min_child_weight': stats.randint(1, 15),
+    'subsample': [0.8],
+    'colsample_bytree': stats.uniform(0.4, 0.6),
+    'colsample_bylevel': stats.uniform(0.4, 0.6)
+}
+XGB_REG_PARAM_DIST = {
+    'reg_alpha': stats.expon(0,20),
+    'reg_lambda': stats.expon(0,20)
+}
 
 
 def get_args() -> Dict:
@@ -112,6 +129,7 @@ def train(cfg):
     random.seed(cfg["seed"])
     np.random.seed(cfg["seed"])
 
+    # set training basins
     if cfg["basins"] is None:
         print("Using random subset of calibration basins")
         cal_basins = get_basin_list(cfg["data_root"], "C")
@@ -131,7 +149,7 @@ def train(cfg):
                      cache_data=cfg["cache_data"], n_jobs=cfg["num_workers"], seed=cfg["seed"],
                      run_metadata=run_metadata)
 
-    exp.set_model(_get_model(cfg))
+    exp.set_model(_get_model(cfg, is_train=True))
     print("Starting training.")
     exp.train()
 
@@ -155,8 +173,9 @@ def predict(user_cfg: Dict):
                      start_date=user_cfg["start_date"], end_date=user_cfg["end_date"])
 
     # load model
-    model = _get_model(run_cfg)
-    model_filename = 'model_epoch30.pt' if run_cfg["model_type"] == 'lstm' else 'model.pkl'
+    model = _get_model(run_cfg, is_train=False)
+    epoch = run_cfg["epochs"] if "epochs" in run_cfg else 30
+    model_filename = f'model_epoch{epoch}.pt' if run_cfg["model_type"] == 'lstm' else 'model.pkl'
     model.load(Path(run_cfg["run_dir"]) / model_filename)
     exp.set_model(model)
 
@@ -173,13 +192,15 @@ def predict(user_cfg: Dict):
           np.min(train_nse_list), np.max(train_nse_list))
 
 
-def _get_model(cfg: Dict) -> LumpedModel:
+def _get_model(cfg: Dict, is_train: bool) -> LumpedModel:
     """Creates model to train or evaluate.
 
     Parameters
     ----------
     cfg : Dict
         Run configuration
+    is_train : bool
+        Whether the model should be loaded for training or prediction.
 
     Returns
     -------
@@ -189,7 +210,8 @@ def _get_model(cfg: Dict) -> LumpedModel:
     Raises
     ------
     ValueError
-        If ``cfg["model_type"]`` is invalid.
+        If ``cfg["model_type"]`` is invalid 
+        or ``cfg["model_args"]`` is insufficient for the model type.
     """
     n_jobs = cfg["num_workers"] if "num_workers" in cfg else 1
     model_args = cfg["model_args"] if "model_args" in cfg else {}
@@ -214,6 +236,25 @@ def _get_model(cfg: Dict) -> LumpedModel:
                            run_dir=cfg["run_dir"],
                            n_jobs=n_jobs,
                            **model_args)
+
+    elif cfg["model_type"] == 'xgb':
+        if is_train:
+            model_args["param_dist"] = XGB_PARAM_DIST
+            model_args["reg_search_param_dist"] = XGB_REG_PARAM_DIST
+            if any([c not in model_args for c in ["n_estimators", "learning_rate",
+                                                  "early_stopping_rounds", "n_cv",
+                                                  "param_search_n_estimators",
+                                                  "param_search_early_stopping_rounds",
+                                                  "param_search_n_iter",
+                                                  "reg_search_n_iter"]]):
+                raise ValueError("XGBoost configuration incomplete.")
+        model = LumpedXGBoost(no_static=cfg["no_static"],
+                              concat_static=cfg["concat_static"],
+                              use_mse=cfg["use_mse"],
+                              run_dir=cfg["run_dir"],
+                              n_jobs=n_jobs,
+                              seed=cfg["seed"],
+                              **model_args)
 
     else:
         raise ValueError(f'Unknown model type {cfg["model_type"]}')
