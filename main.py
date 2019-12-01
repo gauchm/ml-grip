@@ -1,4 +1,5 @@
 import json
+import itertools
 from ast import literal_eval
 import random
 import argparse
@@ -131,27 +132,65 @@ def train(cfg):
 
     # set training basins
     if cfg["basins"] is None:
-        print("Using random subset of calibration basins")
+        #print("Using random subset of calibration basins")
         cal_basins = get_basin_list(cfg["data_root"], "C")
-        cfg["basins"] = np.random.choice(cal_basins,
-                                         size=int(len(cal_basins) * 0.8),
-                                         replace=False)
+        #cfg["basins"] = np.random.choice(cal_basins,
+        #                                 size=int(len(cal_basins) * 0.8),
+        #                                 replace=False)
+        cal_basins = np.random.choice(cal_basins, len(cal_basins), replace=False)
+        basin_chunks = int(len(cal_basins)/4)
 
     run_metadata = {"model_type": cfg["model_type"],
                     "use_mse": cfg["use_mse"]}
+    run_dir = cfg["run_dir"]
     run_metadata.update(cfg["model_args"])
-    print("Setting up experiment.")
-    exp = Experiment(cfg["data_root"], is_train=True, run_dir=cfg["run_dir"],
-                     start_date=cfg["start_date"], end_date=cfg["end_date"],
-                     basins=cfg["basins"], forcing_attributes=cfg["forcing_attributes"],
-                     static_attributes=cfg["static_attributes"], seq_length=cfg["seq_length"],
-                     concat_static=cfg["concat_static"], no_static=cfg["no_static"],
-                     cache_data=cfg["cache_data"], n_jobs=cfg["num_workers"], seed=cfg["seed"],
-                     run_metadata=run_metadata)
+    seq_lengths = [10, 30, 100, 200]
+    dropouts = [0.0, 0.2, 0.4, 0.5]
+    hidden_sizes = [64, 128, 256]
+    learning_rates = [{1: 1e-3},
+                      {1: 5e-3, 11: 1e-3, 21: 5e-4},
+                      {1: 5e-3, 21: 1e-3, 61: 5e-4}]
+    epochs = [30, 50, 100]
+    s, d, h, l, e =list(itertools.product(seq_lengths, dropouts,
+                                          hidden_sizes, learning_rates,
+                                          epochs))[run_metadata["config"]]
+    print(run_metadata["config"], s, d, h, l, e)
+    i = run_metadata["config"]
+    del run_metadata["config"]
+    mins,meds,maxs = [],[],[]
+    for j in range(4):
+        basins = [b for b in cal_basins if b not in cal_basins[j*basin_chunks : (j+1)*basin_chunks]]
+        print(j, basins)
+        print("Setting up experiment.")
+        cfg["run_dir"] = run_dir / str(i) / str(j)
+        run_metadata["learning_rates"] = l
+        run_metadata["hidden_size"] = h
+        run_metadata["epochs"] = e
+        run_metadata["dropout"] = d
+        exp = Experiment(cfg["data_root"], is_train=True, run_dir=cfg["run_dir"],
+                         start_date=cfg["start_date"], end_date=cfg["end_date"],
+                         basins=basins, forcing_attributes=cfg["forcing_attributes"],
+                         static_attributes=cfg["static_attributes"], seq_length=s,
+                         concat_static=cfg["concat_static"], no_static=cfg["no_static"],
+                         cache_data=cfg["cache_data"], n_jobs=cfg["num_workers"], seed=cfg["seed"],
+                         run_metadata=run_metadata)
 
-    exp.set_model(_get_model(cfg, is_train=True))
-    print("Starting training.")
-    exp.train()
+        exp.set_model(_get_model(cfg, is_train=True))
+        print("Starting training.")
+        exp.train()
+        exp.cfg["basins"] = cal_basins
+        results = exp.predict()
+        nses = exp.get_nses()
+        nse_list = list(nses.values())
+        print("Overall NSEs:", np.median(nse_list),
+              np.min(nse_list), np.max(nse_list))
+        mins.append(np.min(nse_list))
+        maxs.append(np.max(nse_list))
+        meds.append(np.median(nse_list))
+
+        store_results(cfg, cfg, results)
+    print(mins, medians, maxs)
+    print(np.mean(medians))
 
 
 def predict(user_cfg: Dict):
@@ -228,6 +267,8 @@ def _get_model(cfg: Dict, is_train: bool) -> LumpedModel:
                                         n_jobs=n_jobs)
     # other models
     elif cfg["model_type"] == 'lstm':
+        if "config" in model_args:
+            del model_args["config"]
         model = LumpedLSTM(len(cfg["forcing_attributes"]),
                            len(cfg["static_attributes"]) - 2,  # lat/lon is not part of training
                            use_mse=cfg["use_mse"],
