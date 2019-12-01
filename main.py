@@ -1,3 +1,4 @@
+import pickle
 import json
 import itertools
 from ast import literal_eval
@@ -7,12 +8,13 @@ from pathlib import Path
 from typing import Dict
 
 import numpy as np
+import pandas as pd
 from scipy import stats
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 
 from mlstream.experiment import Experiment
-from mlstream.utils import store_results
+from mlstream.utils import store_results, nse
 from mlstream.datautils import get_basin_list
 from mlstream.models.base_models import LumpedModel
 from mlstream.models.sklearn_models import LumpedSklearnRegression
@@ -44,7 +46,7 @@ def get_args() -> Dict:
         Dictionary containing the run config.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=["train", "predict"])
+    parser.add_argument('mode', choices=["train", "predict", "combine_ensemble"])
     parser.add_argument('--model_type', type=str, help="Model to train.")
     parser.add_argument('--use_mse', action='store_true',
                         help="If provided, uses MSE as objective/loss function.")
@@ -179,6 +181,8 @@ def train(cfg):
         print("Starting training.")
         exp.train()
         exp.cfg["basins"] = cal_basins
+        exp.cfg["start_date"] = pd.to_datetime("2008-01-01")
+        exp.cfg["end_date"] = pd.to_datetime("2010-12-31")
         results = exp.predict()
         nses = exp.get_nses()
         nse_list = list(nses.values())
@@ -215,7 +219,7 @@ def predict(user_cfg: Dict):
     model = _get_model(run_cfg, is_train=False)
     epoch = run_cfg["epochs"] if "epochs" in run_cfg else 30
     model_filename = f'model_epoch{epoch}.pt' if run_cfg["model_type"] == 'lstm' else 'model.pkl'
-    model.load(Path(run_cfg["run_dir"]) / model_filename)
+    model.load(Path(user_cfg["run_dir"]) / model_filename)
     exp.set_model(model)
 
     results = exp.predict()
@@ -229,6 +233,29 @@ def predict(user_cfg: Dict):
     train_nse_list = list(train_nses.values())
     print("Training basins:", train_nses, np.median(train_nse_list),
           np.min(train_nse_list), np.max(train_nse_list))
+
+
+def combine_ensemble(cfg: Dict):
+    """Combines predictions of multiple runs into one.
+
+    Parameters
+    ----------
+    cfg : Dict
+        Dict with entry "run_dir".
+        Will combine all runs inside this directory.
+    """
+    overall = None
+    for f in cfg["run_dir"].glob("*/results*.p"):
+        print(f)
+        results = pickle.load(f, 'rb')
+        if overall is None:
+            overall = results
+        else:
+            if len(overall) != len(results):
+                print("Length of predictions not equal.")
+            overall['qsim'] + results['qsim']
+    overall['qsim'] /= len(run_dirs)
+    print(f"Ensemble NSE: {nse(overall['qsim'].values, overall['qobs'].values)}.")
 
 
 def _get_model(cfg: Dict, is_train: bool) -> LumpedModel:
