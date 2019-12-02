@@ -10,7 +10,7 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, Lasso
 from sklearn.ensemble import RandomForestRegressor
 
 from mlstream.experiment import Experiment
@@ -147,15 +147,15 @@ def train(cfg):
     run_dir = cfg["run_dir"]
     run_metadata.update(cfg["model_args"])
     seq_lengths = [10, 30, 100, 200]
-    dropouts = [0.0, 0.2, 0.4, 0.5]
-    hidden_sizes = [64, 128, 256]
+    dropouts = [0.0, 0.2, 0.4]
+    hidden_sizes = [128, 256]
     learning_rates = [{1: 1e-3},
                       {1: 5e-3, 11: 1e-3, 21: 5e-4},
-                      {1: 5e-3, 21: 1e-3, 61: 5e-4}]
-    epochs = [30, 50, 100]
-    s, d, h, l, e =list(itertools.product(seq_lengths, dropouts,
+                      {1: 5e-3, 31: 1e-3, 41: 5e-4}]
+    epochs = [30, 50]
+    s, e, h, l, d =list(itertools.product(seq_lengths, epochs,
                                           hidden_sizes, learning_rates,
-                                          epochs))[run_metadata["config"]]
+                                          dropouts))[run_metadata["config"]]
     print(run_metadata["config"], s, d, h, l, e)
     i = run_metadata["config"]
     del run_metadata["config"]
@@ -193,8 +193,8 @@ def train(cfg):
         meds.append(np.median(nse_list))
 
         store_results(cfg, cfg, results)
-    print(mins, medians, maxs)
-    print(np.mean(medians))
+    print(mins, meds, maxs)
+    print(np.mean(meds))
 
 
 def predict(user_cfg: Dict):
@@ -285,6 +285,8 @@ def _get_model(cfg: Dict, is_train: bool) -> LumpedModel:
     # sklearn models
     if cfg["model_type"] == 'linearRegression':
         model = LinearRegression(n_jobs=n_jobs)
+    elif cfg["model_type"] == 'lasso':
+        model = Lasso(n_jobs=n_jobs)
     elif cfg["model_type"] == 'randomForest':
         model = RandomForestRegressor(n_jobs=n_jobs, **model_args)
     if model is not None:
