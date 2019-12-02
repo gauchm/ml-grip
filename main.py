@@ -267,7 +267,8 @@ def _get_model(cfg: Dict, is_train: bool) -> LumpedModel:
                            **model_args)
 
     elif cfg["model_type"] == 'xgb':
-        if is_train:
+        # if model_path is provided, we don't need a parameter search.
+        if is_train and "model_path" not in model_args:
             model_args["param_dist"] = XGB_PARAM_DIST
             model_args["reg_search_param_dist"] = XGB_REG_PARAM_DIST
             if any([c not in model_args for c in ["n_estimators", "learning_rate",
