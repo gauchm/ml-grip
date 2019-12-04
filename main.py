@@ -198,6 +198,9 @@ def predict(user_cfg: Dict):
 
 def combine_ensemble(cfg: Dict):
     """Combines predictions of multiple runs into one.
+    
+    Computes NSE on calibration basins, and pickles ensemble
+    predictions in cfg["run_dir"].
 
     Parameters
     ----------
@@ -206,17 +209,30 @@ def combine_ensemble(cfg: Dict):
         Will combine all runs inside this directory.
     """
     overall = None
-    for f in cfg["run_dir"].glob("*/results*.p"):
+    run_dirs = list(cfg["run_dir"].glob("*/results*.p"))
+    start_date = pd.to_datetime(cfg["start_date"], format='%d%m%Y')
+    end_date = pd.to_datetime(cfg["end_date"], format='%d%m%Y')
+    for f in run_dirs:
         print(f)
-        results = pickle.load(f, 'rb')
+        results = pickle.load(open(f, 'rb'))
         if overall is None:
             overall = results
         else:
             if len(overall) != len(results):
-                print("Length of predictions not equal.")
-            overall['qsim'] + results['qsim']
-    overall['qsim'] /= len(run_dirs)
-    print(f"Ensemble NSE: {nse(overall['qsim'].values, overall['qobs'].values)}.")
+                raise RuntimeError("Different number of basins.")
+            for k, v in overall.items():
+                if len(v) != len(results[k]):
+                    raise RuntimeError("Length of predictions not equal.")
+                v['qsim'] += results[k]['qsim']
+    nses = []
+    for k, v in overall.items():
+        v['qsim'] /= len(run_dirs)
+        v = v.loc[start_date:end_date]
+        if all(~np.isnan(results[k]['qobs'])):
+            nses.append(nse(v['qsim'].values, v['qobs'].values))
+    print(f"Ensemble NSE Median Min Max: {np.median(nses)} {np.min(nses)} {np.max(nses)}.")
+    pickle.dump(overall, open(cfg["run_dir"] / "results_ensemble.p", "wb"))
+    print(f'Successfully saved ensemble predictions in {cfg["run_dir"]}.')
 
 
 def _get_model(cfg: Dict, is_train: bool) -> LumpedModel:
