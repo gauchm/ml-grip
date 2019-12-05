@@ -273,8 +273,11 @@ def _get_model(cfg: Dict, is_train: bool) -> LumpedModel:
                                         n_jobs=n_jobs)
     # other models
     elif cfg["model_type"] == 'lstm':
+        num_static = len(cfg["static_attributes"]) - 2  # lat/lon is not part of training
+        if "Regulation" in cfg["static_attributes"]:
+            num_static += 2  # Regulation is one-hot-encoded
         model = LumpedLSTM(len(cfg["forcing_attributes"]),
-                           len(cfg["static_attributes"]) - 2,  # lat/lon is not part of training
+                           num_static,
                            use_mse=cfg["use_mse"],
                            no_static=cfg["no_static"],
                            concat_static=cfg["concat_static"],
